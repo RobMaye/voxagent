@@ -9,7 +9,7 @@ from pipecat.processors.aggregators.llm_response import (
     LLMAssistantResponseAggregator,
     LLMUserResponseAggregator,
 )
-from services.openai import CustomOpenAILLMService, OpenAITTSService
+from services.openai import BaseOpenAILLMService, OpenAITTSService
 from pipecat.transports.services.daily import DailyParams, DailyTransport
 from pipecat.frames.frames import LLMMessagesFrame  # Import LLMMessagesFrame
 from bot import FitnessOnboardingAgent
@@ -82,7 +82,7 @@ async def main(room_url, token):
     tma_in = LLMUserResponseAggregator(messages)
     tma_out = LLMAssistantResponseAggregator(messages)
 
-    llm = CustomOpenAILLMService(
+    llm = BaseOpenAILLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         functions=agent.functions,

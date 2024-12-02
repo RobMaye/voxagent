@@ -5,6 +5,8 @@ import os
 import argparse
 import subprocess
 import sys
+import ssl
+import certifi
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
@@ -47,7 +49,9 @@ def cleanup():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage the lifespan of the FastAPI application."""
-    aiohttp_session = aiohttp.ClientSession()
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    aiohttp_session = aiohttp.ClientSession(connector=connector)
     daily_helpers["rest"] = DailyRESTHelper(
         daily_api_key=os.getenv("DAILY_API_KEY", ""),
         daily_api_url=os.getenv("DAILY_API_URL", "https://api.daily.co/v1"),

@@ -1,3 +1,9 @@
+#
+# Copyright (c) 2024, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
 import base64
 import io
 import json
@@ -42,10 +48,8 @@ from pipecat.processors.aggregators.openai_llm_context import (
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_services import ImageGenService, LLMService, TTSService
-
 try:
     from openai import (
-        NOT_GIVEN,
         AsyncOpenAI,
         AsyncStream,
         BadRequestError,
@@ -71,6 +75,7 @@ VALID_VOICES: Dict[str, ValidVoice] = {
     "shimmer": "shimmer",
 }
 
+
 class OpenAIUnhandledFunctionException(Exception):
     pass
 
@@ -85,76 +90,14 @@ class BaseOpenAILLMService(LLMService):
     calls from the LLM.
     """
 
-    def parse_actions(self, text):
-        import re
-        pattern = r'<([^<>]+)>'  # Avoid nested angle brackets
-        actions = re.findall(pattern, text)
-        speech_text = re.sub(pattern, ' ', text)
-        speech_text = ' '.join(speech_text.split())
-        return speech_text.strip(), actions\
-        
-    def buffer_ends_with_sentence(self, buffer_text):
-        buffer_text = buffer_text.strip()
-        if not buffer_text:
-            return False
-        return buffer_text[-1] in '.?!'
-
-
-    def buffer_exceeds_length(self, buffer_text, max_length=100):
-        return len(buffer_text.strip()) >= max_length
-
-    async def process_buffer(self):
-        import re
-
-        # Regular expression to find complete action tokens
-        action_pattern = r'<[^<>]+>'
-
-        while self._buffer.strip():
-            # Try to find an action in the buffer
-            match = re.search(action_pattern, self._buffer)
-            if match:
-                # Extract everything before the action
-                before_action = self._buffer[:match.start()]
-                action_token = match.group()
-                self._buffer = self._buffer[match.end():]
-
-                # Normalize and send speech text before the action
-                speech_text = ' '.join(before_action.strip().split())
-                if speech_text:
-                    await self.push_frame(TextFrame(speech_text))
-                    logger.debug(f"Sending to TTS: [{speech_text}]")
-
-                # Extract the action without angle brackets
-                action = action_token[1:-1]
-                logger.info(f"\033[93mAction: {action}\033[0m")
-                await self.push_frame(ActionFrame(action))
-            else:
-                # No complete action token found
-                if self.buffer_ends_with_sentence(self._buffer) or self.buffer_exceeds_length(self._buffer):
-                    # Send buffer to TTS if not empty
-                    speech_text = ' '.join(self._buffer.strip().split())
-                    if speech_text:
-                        await self.push_frame(TextFrame(speech_text))
-                        logger.debug(f"Sending to TTS: [{speech_text}]")
-                    self._buffer = ""
-                else:
-                    # Wait for more data
-                    break
-
-
-
-
-
     class InputParams(BaseModel):
-        frequency_penalty: Optional[float] = Field(
-            default_factory=lambda: NOT_GIVEN, ge=-2.0, le=2.0
-        )
-        presence_penalty: Optional[float] = Field(
-            default_factory=lambda: NOT_GIVEN, ge=-2.0, le=2.0
-        )
-        seed: Optional[int] = Field(default_factory=lambda: NOT_GIVEN, ge=0)
-        temperature: Optional[float] = Field(default_factory=lambda: NOT_GIVEN, ge=0.0, le=2.0)
-        top_p: Optional[float] = Field(default_factory=lambda: NOT_GIVEN, ge=0.0, le=1.0)
+        frequency_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+        presence_penalty: Optional[float] = Field(default=None, ge=-2.0, le=2.0)
+        seed: Optional[int] = Field(default=None, ge=0)
+        temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+        top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+        max_tokens: Optional[int] = Field(default=None, ge=1)
+        max_completion_tokens: Optional[int] = Field(default=None, ge=1)
         extra: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
     def __init__(
@@ -173,10 +116,15 @@ class BaseOpenAILLMService(LLMService):
             "seed": params.seed,
             "temperature": params.temperature,
             "top_p": params.top_p,
+            "max_tokens": params.max_tokens,
+            "max_completion_tokens": params.max_completion_tokens,
             "extra": params.extra if isinstance(params.extra, dict) else {},
         }
+        self._settings = {k: v for k, v in self._settings.items() if v is not None}
+        
         self.set_model_name(model)
         self._client = self.create_client(api_key=api_key, base_url=base_url, **kwargs)
+        self._buffer = ""  # Initialize buffer for text accumulation
 
     def create_client(self, api_key=None, base_url=None, **kwargs):
         return AsyncOpenAI(
@@ -202,14 +150,15 @@ class BaseOpenAILLMService(LLMService):
             "tools": context.tools,
             "tool_choice": context.tool_choice,
             "stream_options": {"include_usage": True},
-            "frequency_penalty": self._settings["frequency_penalty"],
-            "presence_penalty": self._settings["presence_penalty"],
-            "seed": self._settings["seed"],
-            "temperature": self._settings["temperature"],
-            "top_p": self._settings["top_p"],
         }
 
-        params.update(self._settings["extra"])
+        # Add non-None settings
+        settings_without_extra = {k: v for k, v in self._settings.items() if k != "extra"}
+        params.update(settings_without_extra)
+        
+        # Add any extra settings
+        if "extra" in self._settings:
+            params.update(self._settings["extra"])
 
         chunks = await self._client.chat.completions.create(**params)
         return chunks
@@ -248,6 +197,7 @@ class BaseOpenAILLMService(LLMService):
         function_name = ""
         arguments = ""
         tool_call_id = ""
+        self._buffer = ""  # Reset buffer at start
 
         await self.start_ttfb_metrics()
 
@@ -269,20 +219,10 @@ class BaseOpenAILLMService(LLMService):
 
             await self.stop_ttfb_metrics()
 
-
+            if not chunk.choices[0].delta:
+                continue
 
             if chunk.choices[0].delta.tool_calls:
-                # We're streaming the LLM response to enable the fastest response times.
-                # For text, we just yield each chunk as we receive it and count on consumers
-                # to do whatever coalescing they need (eg. to pass full sentences to TTS)
-                #
-                # If the LLM is a function call, we'll do some coalescing here.
-                # If the response contains a function name, we'll yield a frame to tell consumers
-                # that they can start preparing to call the function with that name.
-                # We accumulate all the arguments for the rest of the streamed response, then when
-                # the response is done, we package up all the arguments and the function name and
-                # yield a frame containing the function name and the arguments.
-
                 tool_call = chunk.choices[0].delta.tool_calls[0]
                 if tool_call.index != func_idx:
                     functions_list.append(function_name)
@@ -297,39 +237,23 @@ class BaseOpenAILLMService(LLMService):
                     tool_call_id = tool_call.id
                     await self.call_start_function(context, function_name)
                 if tool_call.function and tool_call.function.arguments:
-                    # Keep iterating through the response to collect all the argument fragments
                     arguments += tool_call.function.arguments
             elif chunk.choices[0].delta.content:
                 text = chunk.choices[0].delta.content
                 logger.debug(f"Raw LLM Output: [{text}]")
-
-                # Append the chunk to the buffer
                 self._buffer += text
-
-                # Process the buffer
                 await self.process_buffer()
 
-        # After the async for chunk in chunk_stream loop
+        # Process any remaining text in the buffer
         if self._buffer.strip():
-            # Process any remaining text in the buffer
             speech_text = ' '.join(self._buffer.strip().split())
-            await self.push_frame(TextFrame(speech_text))
-            logger.debug(f"Sending to TTS at end: [{speech_text}]")
+            if speech_text:
+                await self.push_frame(TextFrame(speech_text))
+                logger.debug(f"Sending to TTS at end: [{speech_text}]")
             self._buffer = ""
 
-
-        logger.debug(f"Raw LLM Output: [{text}]")
-        logger.debug(f"Accumulated Buffer: [{self._buffer}]")
-
-
-
-
-        # if we got a function name and arguments, check to see if it's a function with
-        # a registered handler. If so, run the registered callback, save the result to
-        # the context, and re-prompt to get a chat answer. If we don't have a registered
-        # handler, raise an exception.
+        # Handle function calls
         if function_name and arguments:
-            # added to the list as last function name and arguments not added to the list
             functions_list.append(function_name)
             arguments_list.append(arguments)
             tool_id_list.append(tool_call_id)
@@ -374,6 +298,61 @@ class BaseOpenAILLMService(LLMService):
             await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
 
+    def parse_actions(self, text):
+        import re
+        pattern = r'<([^<>]+)>'  # Avoid nested angle brackets
+        actions = re.findall(pattern, text)
+        speech_text = re.sub(pattern, ' ', text)
+        speech_text = ' '.join(speech_text.split())
+        return speech_text.strip(), actions
+        
+    def buffer_ends_with_sentence(self, buffer_text):
+        buffer_text = buffer_text.strip()
+        if not buffer_text:
+            return False
+        return buffer_text[-1] in '.?!'
+
+    def buffer_exceeds_length(self, buffer_text, max_length=100):
+        return len(buffer_text.strip()) >= max_length
+
+    async def process_buffer(self):
+        import re
+
+        # Regular expression to find complete action tokens
+        action_pattern = r'<[^<>]+>'
+
+        while self._buffer.strip():
+            # Try to find an action in the buffer
+            match = re.search(action_pattern, self._buffer)
+            if match:
+                # Extract everything before the action
+                before_action = self._buffer[:match.start()]
+                action_token = match.group()
+                self._buffer = self._buffer[match.end():]
+
+                # Normalize and send speech text before the action
+                speech_text = ' '.join(before_action.strip().split())
+                if speech_text:
+                    await self.push_frame(TextFrame(speech_text))
+                    logger.debug(f"Sending to TTS: [{speech_text}]")
+
+                # Extract the action without angle brackets
+                action = action_token[1:-1]
+                logger.info(f"\033[93mAction: {action}\033[0m")
+                await self.push_frame(ActionFrame(action))
+            else:
+                # No complete action token found
+                if self.buffer_ends_with_sentence(self._buffer) or self.buffer_exceeds_length(self._buffer):
+                    # Send buffer to TTS if not empty
+                    speech_text = ' '.join(self._buffer.strip().split())
+                    if speech_text:
+                        await self.push_frame(TextFrame(speech_text))
+                        logger.debug(f"Sending to TTS: [{speech_text}]")
+                    self._buffer = ""
+                else:
+                    # Wait for more data
+                    break
+
 
 @dataclass
 class OpenAIContextAggregatorPair:
@@ -387,7 +366,7 @@ class OpenAIContextAggregatorPair:
         return self._assistant
 
 
-class CustomOpenAILLMService(BaseOpenAILLMService):
+class OpenAILLMService(BaseOpenAILLMService):
     def __init__(
         self,
         *,
@@ -396,7 +375,6 @@ class CustomOpenAILLMService(BaseOpenAILLMService):
         **kwargs,
     ):
         super().__init__(model=model, params=params, **kwargs)
-        self._buffer = ""
 
     @staticmethod
     def create_context_aggregator(
@@ -613,6 +591,7 @@ class OpenAIAssistantContextAggregator(LLMAssistantContextAggregator):
                     self._context.add_message(
                         {
                             "role": "assistant",
+                            "content": "",  # content field required for Grok function calling
                             "tool_calls": [
                                 {
                                     "id": frame.tool_call_id,
