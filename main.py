@@ -11,7 +11,7 @@ import asyncio
 import signal
 from loguru import logger
 from dotenv import load_dotenv
-import io
+import json
 import logging
 import traceback
 
@@ -24,9 +24,7 @@ from pipecat.processors.aggregators.llm_response import (
 )
 from services.openai import BaseOpenAILLMService, OpenAITTSService
 from bot import FitnessOnboardingAgent
-from frames import ActionFrame
-from pipecat.frames.frames import OutputAudioRawFrame, LLMMessagesFrame
-from pipecat.processors.frame_processor import FrameProcessor
+from voice import VoiceRecvClient, VoiceTransport
 
 # Configure SSL for Discord
 ssl_context = ssl.create_default_context()
@@ -58,12 +56,9 @@ VOICE_CHANNEL_DISPLAY = "drop-in-chat"
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.voice_states = True  # Required for voice state updates
+intents.voice_states = True
 intents.guilds = True
-bot = commands.Bot(
-    command_prefix='!',
-    intents=intents
-)
+bot = commands.Bot(command_prefix='!', intents=intents)
 
 # Required voice permissions
 VOICE_PERMISSIONS = discord.Permissions(
@@ -81,71 +76,14 @@ VOICE_PERMISSIONS = discord.Permissions(
     manage_channels=True
 )
 
-# Store voice clients and pipelines for each guild
 voice_clients = {}
 pipelines = {}
-
-class DiscordTransport(FrameProcessor):
-    def __init__(self, voice_client, text_channel):
-        super().__init__()
-        self.voice_client = voice_client
-        self.text_channel = text_channel
-        self.audio_queue = asyncio.Queue()
-        self.output_queue = asyncio.Queue()
-        self._first_participant_handlers = []
-        self._audio_callback = None
-
-    def set_audio_callback(self, callback):
-        self._audio_callback = callback
-
-    def input(self):
-        return QueueFrameProcessor(self.audio_queue)
-
-    def output(self):
-        return QueueFrameProcessor(self.output_queue)
-
-    async def on_voice_packet(self, audio_data):
-        """Handle incoming voice packets."""
-        await self.audio_queue.put(audio_data)
-
-    async def process_frame(self, frame, direction):
-        """Process frames, handling audio output."""
-        if isinstance(frame, OutputAudioRawFrame) and self._audio_callback:
-            await self._audio_callback(frame.data)
-        else:
-            await super().process_frame(frame, direction)
-
-    async def notify_first_participant(self, participant):
-        """Notify handlers when first participant joins."""
-        for handler in self._first_participant_handlers:
-            await handler(self, {"id": participant.id, "name": participant.display_name})
-
-    def event_handler(self, event_name):
-        def decorator(func):
-            if event_name == "on_first_participant_joined":
-                self._first_participant_handlers.append(func)
-            return func
-        return decorator
-
-class QueueFrameProcessor(FrameProcessor):
-    def __init__(self, queue):
-        super().__init__()
-        self.queue = queue
-
-    async def process_frame(self, frame, direction):
-        await self.queue.put(frame)
-        await self.push_frame(frame, direction)
-
-class VoiceState:
-    def __init__(self):
-        self.speaking = {}
-
-voice_states = VoiceState()
 
 async def setup_pipeline(guild, voice_client, text_channel):
     """Set up the audio processing pipeline."""
     try:
-        transport = DiscordTransport(voice_client, text_channel)
+        transport = VoiceTransport(voice_client, text_channel)
+        logger.info("Transport initialized")
         
         # Initialize agent and services
         logger.info("Setting up pipeline components...")
@@ -161,7 +99,6 @@ async def setup_pipeline(guild, voice_client, text_channel):
         tma_out = LLMAssistantResponseAggregator(messages)
         logger.info("Message aggregators initialized")
         
-        # Initialize OpenAI client with minimal settings
         llm = BaseOpenAILLMService(
             api_key=OPENAI_API_KEY,
             model=OPENAI_MODEL,
@@ -194,51 +131,34 @@ async def setup_pipeline(guild, voice_client, text_channel):
         )
         logger.info("Pipeline created")
 
-        # Create and store pipeline task
+        # Create pipeline task with parameters
         task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
-        pipelines[guild.id] = (transport, task)
         logger.info("Pipeline task created")
 
+        # Create and start runner
+        runner = PipelineRunner()
+        asyncio.create_task(runner.run(task))
+        logger.info("Pipeline runner started")
+        
+        # Start the transport
+        await transport.start()
+        logger.info("Transport started")
+        
         # Set up first participant handler
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant):
             logger.info(f"Participant {participant['name']} joined the voice chat.")
             # Start conversation by queuing the initial system message
             await task.queue_frames([LLMMessagesFrame([messages[0]])])
-
-        # Start pipeline runner
-        runner = PipelineRunner()
-        asyncio.create_task(runner.run(task))
-        logger.info("Pipeline runner started")
+        
+        # Store pipeline components
+        pipelines[guild.id] = (transport, task)
+        logger.info("Pipeline components stored")
 
         return transport
     except Exception as e:
         logger.exception(f"Error in setup_pipeline: {e}")
         raise
-
-class VoiceRecorder:
-    def __init__(self, transport):
-        self.transport = transport
-        self.recording = {}
-        logger.info("Voice recorder initialized")
-
-    async def on_voice_state_update(self, member, before, after):
-        """Handle voice state updates."""
-        if member.bot:
-            return
-
-        if after and after.channel and after.channel.name == VOICE_CHANNEL_DISPLAY:
-            logger.info(f"Started recording {member.name}")
-            self.recording[member.id] = True
-        elif before and before.channel and before.channel.name == VOICE_CHANNEL_DISPLAY:
-            logger.info(f"Stopped recording {member.name}")
-            self.recording[member.id] = False
-
-    async def on_voice_packet(self, member_id, packet):
-        """Handle incoming voice packets."""
-        if member_id in self.recording and self.recording[member_id]:
-            logger.info(f"Received voice packet from user {member_id}")
-            await self.transport.on_voice_packet(packet)
 
 async def setup_voice_connection(guild, voice_channel, text_channel):
     """Set up voice connection in the specified guild and channel."""
@@ -249,16 +169,36 @@ async def setup_voice_connection(guild, voice_channel, text_channel):
         permissions = voice_channel.permissions_for(guild.me)
         logger.debug(f"Bot permissions in voice channel: {permissions}")
         
-        # Connect to voice channel using default VoiceClient
-        voice_client = await voice_channel.connect(timeout=60.0, reconnect=True)
+        # Connect using our VoiceRecvClient
+        voice_client = await voice_channel.connect(cls=VoiceRecvClient, timeout=60.0, reconnect=True)
         logger.debug(f"Voice client created: {voice_client}")
-        logger.debug(f"Voice client state: connected={voice_client.is_connected()}, playing={voice_client.is_playing()}")
         
+        # Wait for the voice client to be ready
+        tries = 0
+        while not voice_client.is_connected() and tries < 5:
+            logger.debug("Waiting for voice client to connect...")
+            await asyncio.sleep(1)
+            tries += 1
+
         if voice_client.is_connected():
             logger.info("Voice client connected")
-            # Play test sound
-            await play_sound(voice_client, "assets/ding.wav")
-            return voice_client
+            
+            # Set up the pipeline
+            try:
+                transport = await setup_pipeline(guild, voice_client, text_channel)
+                logger.info("Pipeline setup complete")
+                
+                # Store voice client for later use
+                voice_clients[guild.id] = voice_client
+                
+                # Add a debug message
+                await text_channel.send("🎤 Voice system initialized. Try speaking!")
+                
+                return voice_client
+            except Exception as e:
+                logger.error(f"Failed to set up pipeline: {e}")
+                await voice_client.disconnect()
+                raise
         else:
             logger.error("Voice client failed to connect")
             return None
@@ -268,40 +208,82 @@ async def setup_voice_connection(guild, voice_channel, text_channel):
         logger.error(traceback.format_exc())
         return None
 
-async def play_sound(voice_client, sound_file):
-    """Play a sound file through the voice client."""
+@bot.command(name='debug')
+async def debug_command(ctx):
+    """Debug command to check pipeline state."""
     try:
-        if not isinstance(voice_client, discord.VoiceClient):
-            logger.error(f"Invalid voice client type: {type(voice_client)}")
-            return
-
-        if voice_client.is_playing():
-            voice_client.stop()
-        
-        # Create audio source with specific options for better compatibility
-        try:
-            options = '-loglevel warning -ar 48000 -ac 2 -f s16le -acodec pcm_s16le'
-            source = discord.FFmpegPCMAudio(
-                sound_file,
-                before_options='-nostdin',  # Disable stdin to prevent ffmpeg from hanging
-                options=options  # Use specific format options
-            )
-            logger.debug(f"Created audio source for {sound_file}")
-        except Exception as e:
-            logger.error(f"Failed to create audio source: {e}")
-            return
-
-        # Play the audio
-        def after_callback(error):
-            if error:
-                logger.error(f"Error in playback: {error}")
-            else:
-                logger.debug("Finished playing sound")
-
-        voice_client.play(source, after=after_callback)
-        logger.info(f"Playing sound: {sound_file}")
+        guild = ctx.guild
+        if guild.id in pipelines:
+            transport, task = pipelines[guild.id]
+            debug_info = transport.get_debug_info()
+            await ctx.send(f"Debug Info:\n```json\n{json.dumps(debug_info, indent=2)}\n```")
+        else:
+            await ctx.send("❌ No pipeline found for this guild")
     except Exception as e:
-        logger.error(f"Error playing sound: {e}")
+        logger.error(f"Error in debug command: {e}")
+        await ctx.send(f"❌ Error: {str(e)}")
+
+@bot.command(name='restart')
+async def restart_pipeline(ctx):
+    """Restart the pipeline."""
+    try:
+        guild = ctx.guild
+        if guild.id in pipelines:
+            # Get the current voice and text channels
+            voice_channel = ctx.guild.voice_client.channel if ctx.guild.voice_client else None
+            text_channel = ctx.channel
+            
+            # Clean up existing pipeline
+            transport, task = pipelines[guild.id]
+            await transport.stop()
+            
+            if ctx.guild.voice_client:
+                await ctx.guild.voice_client.disconnect()
+            
+            await asyncio.sleep(1)  # Give it a moment to clean up
+            
+            # Reconnect and set up new pipeline
+            if voice_channel:
+                voice_client = await setup_voice_connection(guild, voice_channel, text_channel)
+                if voice_client:
+                    await ctx.send("✅ Pipeline restarted successfully")
+                else:
+                    await ctx.send("❌ Failed to restart pipeline")
+            else:
+                await ctx.send("❌ No voice channel found")
+        else:
+            await ctx.send("❌ No pipeline found for this guild")
+    except Exception as e:
+        logger.error(f"Error in restart command: {e}")
+        await ctx.send(f"❌ Error restarting pipeline: {str(e)}")
+
+@bot.event
+async def on_ready():
+    """Event handler for when the bot is ready."""
+    logger.info(f"{bot.user} has connected to Discord!")
+    logger.info(f'Bot is in {len(bot.guilds)} guilds')
+    
+    # Set up channels and join voice in all guilds
+    for guild in bot.guilds:
+        logger.debug(f"Setting up guild: {guild.name}")
+        text_channel, voice_channel = await ensure_channels(guild)
+        if text_channel and voice_channel:
+            logger.debug(f"Found channels: text={text_channel.name}, voice={voice_channel.name}")
+            voice_client = await setup_voice_connection(guild, voice_channel, text_channel)
+            if voice_client:
+                logger.info(f"Successfully set up voice in {guild.name}")
+            else:
+                logger.error(f"Failed to set up voice in {guild.name}")
+        else:
+            logger.warning(f"Could not find required channels in {guild.name}")
+    
+    # Generate invite link with required permissions
+    app_info = await bot.application_info()
+    invite_url = discord.utils.oauth_url(
+        app_info.id,
+        permissions=VOICE_PERMISSIONS
+    )
+    logger.info(f'Invite URL: {invite_url}')
 
 async def ensure_channels(guild):
     """Ensure the required channels exist in the guild."""
@@ -327,107 +309,9 @@ async def ensure_channels(guild):
 
     return text_channel, voice_channel
 
-@bot.event
-async def on_ready():
-    """Event handler for when the bot is ready."""
-    logger.info(f'{bot.user} has connected to Discord!')
-    logger.info(f'Bot is in {len(bot.guilds)} guilds')
-    
-    # Set up channels and join voice in all guilds
-    for guild in bot.guilds:
-        logger.debug(f"Setting up guild: {guild.name}")
-        text_channel, voice_channel = await ensure_channels(guild)
-        if text_channel and voice_channel:
-            logger.debug(f"Found channels: text={text_channel.name}, voice={voice_channel.name}")
-            await setup_voice_connection(guild, voice_channel, text_channel)
-        else:
-            logger.warning(f"Could not find required channels in {guild.name}")
-    
-    # Generate invite link with required permissions
-    app_info = await bot.application_info()
-    invite_url = discord.utils.oauth_url(
-        app_info.id,
-        permissions=VOICE_PERMISSIONS
-    )
-    logger.info(f'Invite URL: {invite_url}')
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    """Handle voice state updates."""
-    if member.id != bot.user.id:  # Don't respond to bot's own state changes
-        if before.channel != after.channel:
-            if after.channel and after.channel.guild.voice_client:
-                # Member joined a channel where bot is present
-                logger.info(f"User {member.name} joined voice channel")
-                await play_sound(after.channel.guild.voice_client, "assets/ding.wav")
-
-    # Debug voice state
-    logger.debug(f"Voice state update for {member.name}:")
-    if before.channel:
-        logger.debug(f"  Before: channel={before.channel.name}, self_mute={before.self_mute}, self_deaf={before.self_deaf}")
-    else:
-        logger.debug(f"  Before: channel=None, self_mute={before.self_mute}, self_deaf={before.self_deaf}")
-    
-    if after.channel:
-        logger.debug(f"  After: channel={after.channel.name}, self_mute={after.self_mute}, self_deaf={after.self_deaf}")
-        logger.debug(f"User {member.name} joined voice channel {after.channel.name}")
-    else:
-        logger.debug(f"  After: channel=None, self_mute={after.self_mute}, self_deaf={after.self_deaf}")
-
-    if member.id == bot.user.id:
-        logger.debug("Voice state update is for bot")
-        return
-
-    # If someone joins our voice channel
-    if after and after.channel and after.channel.name == VOICE_CHANNEL_DISPLAY:
-        guild = member.guild
-        logger.debug(f"User {member.name} joined voice channel {after.channel.name}")
-        
-        if guild.id in pipelines:
-            transport, _ = pipelines[guild.id]
-            await transport.notify_first_participant(member)
-            
-            # Update recorder state
-            voice_client = voice_clients.get(guild.id)
-            logger.debug(f"Voice client for guild: {voice_client}")
-            if voice_client and hasattr(voice_client, 'recorder'):
-                logger.debug("Updating recorder state")
-                await voice_client.recorder.on_voice_state_update(member, before, after)
-            else:
-                logger.warning("No voice client or recorder found")
-            
-            # Send welcome message
-            text_channel = discord.utils.get(guild.text_channels, name=TEXT_CHANNEL_DISPLAY)
-            if text_channel:
-                await text_channel.send(f"👋 {member.name} has joined the voice chat!")
-
-    # If someone leaves our voice channel
-    elif before and before.channel and before.channel.name == VOICE_CHANNEL_DISPLAY:
-        logger.debug(f"User {member.name} left voice channel {before.channel.name}")
-        # Update recorder state
-        guild = member.guild
-        voice_client = voice_clients.get(guild.id)
-        if voice_client and hasattr(voice_client, 'recorder'):
-            await voice_client.recorder.on_voice_state_update(member, before, after)
-            
-        text_channel = discord.utils.get(member.guild.text_channels, name=TEXT_CHANNEL_DISPLAY)
-        if text_channel:
-            await text_channel.send(f"👋 {member.name} has left the voice chat!")
-
-@bot.event
-async def on_voice_receive(user, data):
-    """Handle received voice data."""
-    if user.bot:
-        return
-        
-    guild = user.guild
-    voice_client = voice_clients.get(guild.id)
-    if voice_client and hasattr(voice_client, 'recorder'):
-        await voice_client.recorder.on_voice_packet(user.id, data)
-
 def terminate_process():
-    """Force terminate the process."""
-    logger.warning("Force terminating process...")
+    """Terminate the process."""
+    logger.info("Terminating process...")
     os.kill(os.getpid(), signal.SIGKILL)
 
 async def cleanup():
@@ -435,18 +319,17 @@ async def cleanup():
     logger.info("Starting cleanup...")
     
     try:
+        # Stop all transports
+        for guild_id, (transport, task) in pipelines.items():
+            try:
+                await transport.stop()
+            except:
+                pass
+        
         # Cancel all tasks
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
-        
-        # Disconnect voice clients
-        for voice_client in voice_clients.values():
-            try:
-                if voice_client and voice_client.is_connected():
-                    await voice_client.disconnect(force=True)
-            except:
-                pass
         
         # Close bot
         if not bot.is_closed():
