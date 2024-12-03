@@ -130,11 +130,19 @@ class BaseOpenAILLMService(LLMService):
         return AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            http_client=DefaultAsyncHttpxClient(
+            http_client=httpx.AsyncClient(
                 limits=httpx.Limits(
-                    max_keepalive_connections=100, max_connections=1000, keepalive_expiry=None
+                    max_keepalive_connections=100,
+                    max_connections=1000,
+                    keepalive_expiry=None
+                ),
+                timeout=httpx.Timeout(
+                    connect=5.0,
+                    read=600.0,
+                    write=600.0,
+                    pool=600.0
                 )
-            ),
+            )
         )
 
     def can_generate_metrics(self) -> bool:
