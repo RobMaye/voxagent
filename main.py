@@ -263,6 +263,13 @@ async def on_ready():
     logger.info(f"{bot.user} has connected to Discord!")
     logger.info(f'Bot is in {len(bot.guilds)} guilds')
     
+    # Load voice commands
+    try:
+        await bot.load_extension('voice.commands')
+        logger.info("Voice commands loaded")
+    except Exception as e:
+        logger.error(f"Failed to load voice commands: {e}")
+    
     # Set up channels and join voice in all guilds
     for guild in bot.guilds:
         logger.debug(f"Setting up guild: {guild.name}")

@@ -8,27 +8,57 @@ from threading import Lock
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class AudioPacket:
+    """Container for audio data with sequence information."""
+    data: bytes
+    sequence: int
+    timestamp: float
 
 class OpusBufferedAudio(discord.AudioSource):
-    """Buffered audio source that properly handles Discord's audio requirements."""
+    """Buffered audio source that properly handles Discord's audio requirements.
+    
+    Input format (from discord-voice-recv):
+    - 48kHz sample rate
+    - 2 channels (stereo)
+    - 16-bit signed little-endian PCM
+    
+    Output format (for discord.py):
+    - 48kHz sample rate
+    - 2 channels (stereo)
+    - 16-bit signed little-endian PCM
+    """
     
     def __init__(self, buffer_duration: float = 0.1):
-        self.buffer = deque()
         self.lock = Lock()
         self.frame_duration = 0.02  # 20ms frames
-        self.input_sample_rate = 48000  # Discord voice receive sample rate
-        self.output_sample_rate = 48000  # Discord playback sample rate
-        self.input_channels = 1  # Mono input
-        self.output_channels = 2  # Stereo output
+        self.sample_rate = 48000
+        self.channels = 2  # Both input and output are stereo
         self.bytes_per_sample = 2  # 16-bit audio
+        self.buffer_size = int(buffer_duration * 1000)  # Buffer size in ms
         
-        self.frame_size = int(self.output_sample_rate * self.frame_duration * self.bytes_per_sample * self.output_channels)
+        # Calculate frame size (same for input and output since format matches)
+        self.frame_size = int(self.sample_rate * self.frame_duration * self.bytes_per_sample * self.channels)
+        
+        # Sequence tracking
+        self.next_sequence = 0
+        self.last_read_sequence = -1
+        self.last_timestamp = 0.0
+        
+        # Ordered buffer with max length
+        max_frames = int(self.buffer_size / (self.frame_duration * 1000))
+        self.buffer = deque(maxlen=max_frames)
         
         logger.info(f"Audio configuration:")
-        logger.info(f"- Input: {self.input_sample_rate}Hz, {self.input_channels} channel(s)")
-        logger.info(f"- Output: {self.output_sample_rate}Hz, {self.output_channels} channel(s)")
+        logger.info(f"- Sample rate: {self.sample_rate}Hz")
+        logger.info(f"- Channels: {self.channels}")
         logger.info(f"- Frame size: {self.frame_size} bytes ({self.frame_duration * 1000}ms)")
+        logger.info(f"- Buffer size: {self.buffer_size}ms ({max_frames} frames)")
         
+        # Start FFmpeg process
         self._start_ffmpeg()
         
         self.running = True
@@ -36,7 +66,7 @@ class OpusBufferedAudio(discord.AudioSource):
         self.buffer_thread.start()
 
     def _start_ffmpeg(self):
-        """Start the FFmpeg process with correct parameters."""
+        """Start FFmpeg process with exact Discord specifications."""
         if hasattr(self, 'process') and self.process:
             try:
                 self.process.terminate()
@@ -44,74 +74,99 @@ class OpusBufferedAudio(discord.AudioSource):
             except Exception as e:
                 logger.error(f"Error cleaning up old FFmpeg process: {e}")
 
-        # Simple and direct FFmpeg pipeline:
-        # 1. Read 48kHz mono PCM
-        # 2. Convert to stereo by duplicating the mono channel
-        # 3. Output 48kHz stereo PCM
+        # FFmpeg command to pass through audio unchanged
         self.process = subprocess.Popen(
             [
                 'ffmpeg',
-                '-f', 's16le',           # Input format: Signed 16-bit little-endian
-                '-ar', str(self.input_sample_rate),  # Input sample rate
-                '-ac', str(self.input_channels),     # Input channels
+                # Input settings
+                '-f', 's16le',           # Format: Signed 16-bit little-endian
+                '-ar', str(self.sample_rate),  # Sample rate: 48kHz
+                '-ac', str(self.channels),     # Channels: 2 (stereo)
                 '-i', 'pipe:0',          # Read from stdin
                 
-                # Simple filter to duplicate mono to both stereo channels
-                '-af', 'pan=stereo|c0=c0|c1=c0',
+                # Output settings (same as input)
+                '-f', 's16le',           # Format: Signed 16-bit little-endian
+                '-ar', str(self.sample_rate),  # Sample rate: 48kHz
+                '-ac', str(self.channels),     # Channels: 2 (stereo)
                 
-                '-f', 's16le',           # Output format: Signed 16-bit little-endian
-                '-ar', str(self.output_sample_rate), # Output sample rate
-                '-ac', str(self.output_channels),    # Output channels
-                '-loglevel', 'warning',   # Only show warnings and errors
+                # No audio filters needed since format matches
+                '-c:a', 'pcm_s16le',     # Explicit codec
+                
+                '-loglevel', 'warning',
                 'pipe:1'                 # Write to stdout
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
-        logger.info("FFmpeg process started")
+        logger.info("FFmpeg process started with Discord audio specifications")
     
     def _process_buffer(self):
         """Process the buffer in a separate thread."""
         while self.running:
             with self.lock:
                 if self.buffer:
-                    data = self.buffer.popleft()
-                    try:
-                        if not hasattr(self, '_logged_first_packet'):
-                            logger.info(f"Processing first audio packet: {len(data)} bytes")
-                            self._logged_first_packet = True
-                        
-                        self.process.stdin.write(data)
-                        self.process.stdin.flush()
-                    except Exception as e:
-                        logger.error(f"Error writing to FFmpeg: {e}")
-                        if self.process and self.process.stderr:
-                            error = self.process.stderr.read()
-                            if error:
-                                logger.error(f"FFmpeg error: {error.decode()}")
-                        self._start_ffmpeg()  # Restart FFmpeg
-            time.sleep(0.001)  # Small sleep to prevent CPU spinning
+                    # Get the next packet in sequence
+                    next_packet = None
+                    for packet in sorted(self.buffer, key=lambda x: x.sequence):
+                        if packet.sequence == self.last_read_sequence + 1:
+                            next_packet = packet
+                            self.buffer.remove(packet)
+                            break
+                    
+                    if next_packet:
+                        try:
+                            if not hasattr(self, '_logged_first_packet'):
+                                logger.info(f"Processing first audio packet: sequence {next_packet.sequence}")
+                                self._logged_first_packet = True
+                            
+                            # Maintain timing between packets
+                            time_since_last = time.time() - self.last_timestamp
+                            if time_since_last < self.frame_duration:
+                                time.sleep(self.frame_duration - time_since_last)
+                            
+                            self.process.stdin.write(next_packet.data)
+                            self.process.stdin.flush()
+                            self.last_read_sequence = next_packet.sequence
+                            self.last_timestamp = time.time()
+                            
+                        except Exception as e:
+                            logger.error(f"Error writing to FFmpeg: {e}")
+                            if self.process and self.process.stderr:
+                                error = self.process.stderr.read()
+                                if error:
+                                    logger.error(f"FFmpeg error: {error.decode()}")
+                            self._start_ffmpeg()
+            time.sleep(0.001)
     
     def add_audio(self, pcm_data: bytes):
-        """Add PCM data to the buffer."""
+        """Add PCM data to the buffer with sequence number."""
         with self.lock:
+            # Create packet with sequence number and timestamp
+            packet = AudioPacket(
+                data=pcm_data,
+                sequence=self.next_sequence,
+                timestamp=time.time()
+            )
+            self.next_sequence += 1
+            
+            # Log buffer stats periodically
             if not hasattr(self, '_last_log') or time.time() - self._last_log > 5.0:
-                logger.debug(f"Adding audio packet: {len(pcm_data)} bytes")
+                logger.debug(f"Buffer status: {len(self.buffer)}/{self.buffer.maxlen} packets, "
+                           f"next_seq={self.next_sequence}, last_read={self.last_read_sequence}")
                 self._last_log = time.time()
-            self.buffer.append(pcm_data)
+            
+            self.buffer.append(packet)
     
     def read(self) -> bytes:
         """Read audio data in 20ms chunks."""
         try:
-            # Read exactly one frame of audio
             data = self.process.stdout.read(self.frame_size)
             if not data:
-                return b'\x00' * self.frame_size  # Return silence if no data
+                return b'\x00' * self.frame_size
             
             if len(data) != self.frame_size:
                 logger.warning(f"Unexpected frame size: got {len(data)}, expected {self.frame_size}")
-                # Pad with silence if we got less data than expected
                 data = data.ljust(self.frame_size, b'\x00')
             
             return data
@@ -157,12 +212,24 @@ class VoiceRecvClient(voice_recv.VoiceRecvClient):
         if data.pcm and self.audio_source:
             try:
                 self.audio_source.add_audio(data.pcm)
-                # Start playing if not already playing
                 if not self.is_playing():
                     logger.debug("Starting audio playback")
                     self.play(self.audio_source, after=lambda e: logger.error(f"Player error: {e}") if e else None)
             except Exception as e:
                 logger.error(f"Error processing audio packet: {e}")
+
+    async def update_audio_settings(self, **kwargs):
+        """Update audio settings."""
+        if self.audio_source:
+            self.audio_source.update_settings(**kwargs)
+            return self.audio_source.get_settings()
+        return None
+
+    def get_audio_settings(self):
+        """Get current audio settings."""
+        if self.audio_source:
+            return self.audio_source.get_settings()
+        return None
 
     async def wait_for_connection(self, timeout: float = 5.0) -> bool:
         """Wait for voice connection to be established."""
@@ -183,7 +250,7 @@ class VoiceRecvClient(voice_recv.VoiceRecvClient):
                 return
 
             logger.info("Creating new audio source and sink")
-            self.audio_source = OpusBufferedAudio()
+            self.audio_source = OpusBufferedAudio(buffer_duration=0.1)  # 100ms buffer
             self._sink = voice_recv.BasicSink(self.audio_callback)
             try:
                 logger.info("Starting to listen")
